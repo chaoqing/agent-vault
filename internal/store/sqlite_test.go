@@ -1449,7 +1449,6 @@ func TestCascadeDeleteVaultRemovesProposals(t *testing.T) {
 	}
 }
 
-
 // --- UUID ---
 
 func TestNewUUIDUniqueness(t *testing.T) {
@@ -1676,7 +1675,6 @@ func TestDeleteUserSessions(t *testing.T) {
 		t.Fatalf("expected sql.ErrNoRows after deleting user sessions, got %v", err)
 	}
 }
-
 
 func TestDeleteUserCascadesGrants(t *testing.T) {
 	s := openTestDB(t)
@@ -1954,7 +1952,6 @@ func TestGetSessionBackwardCompat(t *testing.T) {
 		t.Fatalf("expected empty agent_id for old session, got %q", fetched.AgentID)
 	}
 }
-
 
 func TestDeleteAgentTokens(t *testing.T) {
 	s := openTestDB(t)

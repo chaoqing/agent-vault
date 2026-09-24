@@ -43,8 +43,6 @@ func utcTimePtr(t *time.Time) *time.Time {
 	return &u
 }
 
-
-
 // nullableString returns nil for empty strings, enabling SQL NULL inserts.
 func nullableString(s string) interface{} {
 	if s == "" {

@@ -59,6 +59,11 @@ func MergeServices(existing []broker.Service, proposed []Service) ([]broker.Serv
 				if len(p.Substitutions) == 0 {
 					next.Substitutions = merged[idx].Substitutions
 				}
+				// Egress proxy selection is operator-owned: an agent must not
+				// be able to set it (the proposal wire form has no such
+				// field) nor clear it by proposing an unrelated change to
+				// the service.
+				next.UpstreamProxy = merged[idx].UpstreamProxy
 				merged[idx] = next
 			default:
 				nameIndex[p.Name] = len(merged)

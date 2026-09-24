@@ -35,6 +35,15 @@ type Service struct {
 	Enabled       *bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	Auth          Auth           `yaml:"auth" json:"auth"`
 	Substitutions []Substitution `yaml:"substitutions,omitempty" json:"substitutions,omitempty"`
+	// UpstreamProxy names an instance-level egress proxy profile that carries
+	// this service's requests to the real upstream. Empty means "use the
+	// instance default (or dial directly when there is none)".
+	//
+	// Operators set this through the admin service endpoints; proposals keep
+	// whatever value is already stored (see proposal.merge#UpstreamProxy) so
+	// an agent can neither introduce nor drop egress routing for credentials
+	// it does not own.
+	UpstreamProxy string `yaml:"upstream_proxy,omitempty" json:"upstream_proxy,omitempty"`
 }
 
 // MatcherPattern returns the joined inline form (`slack.com/api/*`),
@@ -378,6 +387,31 @@ func Validate(cfg *Config) error {
 		}
 		if err := s.ValidateSubstitutions(); err != nil {
 			return fmt.Errorf("service %d: %w", i, err)
+		}
+		if err := ValidateUpstreamProxyName(s.UpstreamProxy); err != nil {
+			return fmt.Errorf("service %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// ValidateUpstreamProxyName checks that name can be used to reference an
+// egress proxy profile. Empty is valid and means "no override". Profiles are
+// referenced rather than inlined, so the name must stay small, printable, and
+// free of characters that would complicate logging or JSON round-tripping.
+func ValidateUpstreamProxyName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("upstream_proxy must be at most 64 characters")
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("upstream_proxy must not contain control characters")
+		}
+		if strings.ContainsRune(" \t\r\n\"'\\/@#:,", r) {
+			return fmt.Errorf("upstream_proxy must not contain %q", string(r))
 		}
 	}
 	return nil

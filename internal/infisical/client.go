@@ -352,3 +352,14 @@ func loginWithMethod(c sdk.InfisicalClientInterface, method AuthMethod) error {
 		return fmt.Errorf("infisical: unsupported auth method %q", method)
 	}
 }
+
+// SetRoundTripper installs a custom transport for the client's direct HTTP
+// calls (project slug lookups and similar control-plane requests). The server
+// uses it to route external secret-store traffic through the instance's
+// outbound proxy. Passing nil restores the standard transport.
+func (c *Client) SetRoundTripper(rt http.RoundTripper) {
+	if c == nil {
+		return
+	}
+	c.httpc = &http.Client{Timeout: 10 * time.Second, Transport: rt}
+}

@@ -30,6 +30,8 @@ var tp = timePtr
 
 // mockStore implements Store for testing.
 type mockStore struct {
+	upstreamProxies    map[string]*store.UpstreamProxy
+	upstreamProxyRefs  map[string][]string
 	masterKeyRecord    *store.MasterKeyRecord
 	sessions           map[string]*store.Session
 	vaults             map[string]*store.Vault
@@ -52,16 +54,18 @@ type mockStore struct {
 
 func newMockStore() *mockStore {
 	ms := &mockStore{
-		sessions:      make(map[string]*store.Session),
-		vaults:        make(map[string]*store.Vault),
-		credentials:   make(map[string]*store.Credential),
-		brokerConfigs: make(map[string]*store.BrokerConfig),
-		users:         make(map[string]*store.User),
-		userInvites:   make(map[string]*store.UserInvite),
-		agents:        make(map[string]*store.Agent),
-		settings:      make(map[string]string),
-		vaultSettings: make(map[string]map[string]string),
-		credStores:    make(map[string]*store.VaultCredentialStore),
+		sessions:          make(map[string]*store.Session),
+		vaults:            make(map[string]*store.Vault),
+		credentials:       make(map[string]*store.Credential),
+		brokerConfigs:     make(map[string]*store.BrokerConfig),
+		users:             make(map[string]*store.User),
+		userInvites:       make(map[string]*store.UserInvite),
+		agents:            make(map[string]*store.Agent),
+		settings:          make(map[string]string),
+		vaultSettings:     make(map[string]map[string]string),
+		credStores:        make(map[string]*store.VaultCredentialStore),
+		upstreamProxies:   make(map[string]*store.UpstreamProxy),
+		upstreamProxyRefs: make(map[string][]string),
 	}
 	// Seed root vault
 	ms.vaults["default"] = &store.Vault{ID: "root-ns-id", Name: "default"}
@@ -389,9 +393,9 @@ func (m *mockStore) ExpirePendingProposals(_ context.Context, before time.Time) 
 	return 0, nil
 }
 
-func (m *mockStore) Close() error                                     { return nil }
-func (m *mockStore) Ping(_ context.Context) error                      { return nil }
-func (m *mockStore) DialectName() string                               { return "sqlite" }
+func (m *mockStore) Close() error                                         { return nil }
+func (m *mockStore) Ping(_ context.Context) error                         { return nil }
+func (m *mockStore) DialectName() string                                  { return "sqlite" }
 func (m *mockStore) GetCAState(_ context.Context) (*store.CAState, error) { return nil, nil }
 func (m *mockStore) SetCAState(_ context.Context, _ *store.CAState) error { return nil }
 
@@ -1143,6 +1147,109 @@ func (m *mockStore) DeleteVaultSetting(_ context.Context, vaultID, key string) e
 		delete(vs, key)
 	}
 	return nil
+}
+
+// --- Upstream proxies (egress) ---
+//
+// The mock keeps profiles in a name-keyed map so handler tests can assert
+// permission decisions and reference protection without a database.
+
+func (m *mockStore) ListUpstreamProxies(_ context.Context) ([]store.UpstreamProxy, error) {
+	out := make([]store.UpstreamProxy, 0, len(m.upstreamProxies))
+	for _, p := range m.upstreamProxies {
+		out = append(out, *p)
+	}
+	return out, nil
+}
+
+func (m *mockStore) GetUpstreamProxyByName(_ context.Context, name string) (*store.UpstreamProxy, error) {
+	if p, ok := m.upstreamProxies[name]; ok {
+		return p, nil
+	}
+	return nil, sql.ErrNoRows
+}
+
+func (m *mockStore) GetDefaultUpstreamProxy(_ context.Context) (*store.UpstreamProxy, error) {
+	for _, p := range m.upstreamProxies {
+		if p.IsDefault && p.Enabled {
+			return p, nil
+		}
+	}
+	return nil, sql.ErrNoRows
+}
+
+func (m *mockStore) CreateUpstreamProxy(_ context.Context, p *store.UpstreamProxy) error {
+	if _, exists := m.upstreamProxies[p.Name]; exists {
+		return fmt.Errorf("UNIQUE constraint failed: upstream_proxies.name")
+	}
+	if p.IsDefault {
+		for _, existing := range m.upstreamProxies {
+			existing.IsDefault = false
+		}
+	}
+	copied := *p
+	m.upstreamProxies[p.Name] = &copied
+	return nil
+}
+
+func (m *mockStore) UpdateUpstreamProxy(_ context.Context, params store.UpdateUpstreamProxyParams) (*store.UpstreamProxy, error) {
+	p, ok := m.upstreamProxies[params.Name]
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	if params.Scheme != nil {
+		p.Scheme = *params.Scheme
+	}
+	if params.Host != nil {
+		p.Host = *params.Host
+	}
+	if params.NoProxy != nil {
+		p.NoProxy = *params.NoProxy
+	}
+	if params.ProxyCAPEM != nil {
+		p.ProxyCAPEM = *params.ProxyCAPEM
+	}
+	if params.OnFailure != nil {
+		p.OnFailure = *params.OnFailure
+	}
+	if params.Enabled != nil {
+		p.Enabled = *params.Enabled
+	}
+	if params.IsDefault != nil {
+		if *params.IsDefault {
+			for name, existing := range m.upstreamProxies {
+				if name != params.Name {
+					existing.IsDefault = false
+				}
+			}
+		}
+		p.IsDefault = *params.IsDefault
+	}
+	if params.UsernameCT != nil {
+		p.UsernameCT = *params.UsernameCT
+	}
+	if params.UsernameNonce != nil {
+		p.UsernameNonce = *params.UsernameNonce
+	}
+	if params.PasswordCT != nil {
+		p.PasswordCT = *params.PasswordCT
+	}
+	if params.PasswordNonce != nil {
+		p.PasswordNonce = *params.PasswordNonce
+	}
+	return p, nil
+}
+
+func (m *mockStore) DeleteUpstreamProxy(_ context.Context, name string) error {
+	if _, ok := m.upstreamProxies[name]; !ok {
+		return sql.ErrNoRows
+	}
+	delete(m.upstreamProxies, name)
+	return nil
+}
+
+func (m *mockStore) CountUpstreamProxyReferences(_ context.Context, name string) ([]string, error) {
+	return m.upstreamProxyRefs[name], nil
 }
 
 // External credential stores: minimal stubs so existing tests link; behavior

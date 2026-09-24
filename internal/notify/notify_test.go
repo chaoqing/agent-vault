@@ -257,7 +257,8 @@ func TestSendSTARTTLS_RequiredMode_NoSTARTTLS(t *testing.T) {
 	smtpAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(addr.Port))
 	msg := buildMessage(cfg.FromName, cfg.From, []string{"to@example.com"}, "Test", "body")
 
-	err = sendSTARTTLS(cfg, smtpAddr, []string{"to@example.com"}, msg)
+	n := New(cfg)
+	err = n.sendSTARTTLS(cfg, smtpAddr, []string{"to@example.com"}, msg)
 	if err == nil {
 		t.Fatal("expected error when STARTTLS required but not available")
 	}

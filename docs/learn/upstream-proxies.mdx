@@ -1,0 +1,140 @@
+---
+title: "Upstream Proxies"
+description: "Route requests leaving Agent Vault through an operator-configured egress proxy."
+---
+
+An **upstream proxy** is an egress proxy that carries a request from Agent Vault to the real API after credentials have been injected. Without one, the broker dials each target directly; with one, every matching request leaves through the proxy you control — the hop where corporate networks expect traffic to enter, be filtered, logged, or audited.
+
+Upstream proxies are instance-level configuration owned by the instance [owner](/learn/permissions#instance-roles). Services reference a profile *by name* rather than inlining credentials and endpoints, so one profile can be shared across vaults and rotated in a single place.
+
+<Note>
+  Upstream proxies describe how the broker reaches the **upstream**. The proxy
+  your agents already use (the `HTTPS_PROXY` Agent Vault sets up for them) is
+  the *ingress* side and is unchanged by anything on this page.
+</Note>
+
+## How a route is chosen
+
+For each brokered request, the first matching rule wins:
+
+| Precedence | Rule | Applies to |
+| --- | --- | --- |
+| 1 | The profile named by the matched service's `upstream_proxy` | Requests that matched a [service](/learn/services) |
+| 2 | The instance default profile (`is_default`) | Everything else, including unmatched requests and the broker's own outbound calls ([OAuth](/learn/credentials) token refreshes, external credential stores, SMTP) |
+| 3 | No proxy — dial the target directly | Default behaviour when no profile applies |
+
+A named-but-missing profile falls back to rule 2 rather than failing the request, and logs a warning. A named-but-disabled profile does the same, which makes **Enabled** a usable kill switch without having to edit every service that references it.
+
+## Profile fields
+
+| Field | Description |
+| --- | --- |
+| `name` | Operator-facing identifier services reference. Up to 64 characters; avoid spaces and the characters `"` `'` `\` `/` `@` `#` `:` `,` so referencing always round-trips. Immutable once created. |
+| `scheme` | How the broker talks to the proxy: `http`, `https`, `socks5`, `socks5h`. |
+| `host` | Proxy endpoint as `host:port`. No scheme, no path — the port is required. |
+| `username` / `password` | Optional proxy credentials. Encrypted at rest and never returned by any read endpoint; the UI reports only whether they are set. |
+| `no_proxy` | Comma-separated hosts that skip this proxy (`NO_PROXY` matching: exact host, optional leading dot for suffix matching, or `*` for everything). |
+| `proxy_ca_pem` | PEM certificate authority used to verify the proxy itself. Needed for `https` proxies and `socks5h` served with a private CA. |
+| `on_failure` | What happens when the proxy cannot be reached: `fail_closed` (default) or `fail_open`. |
+| `is_default` | Applies to everything that does not name a profile. Setting it clears the previous default — there is exactly one. |
+| `enabled` | When false, the profile is skipped and its traffic falls back to the default (or dials directly). |
+
+### Schemes
+
+| Scheme | Behaviour |
+| --- | --- |
+| `http` | Plain HTTP proxy. HTTPS upstreams use `CONNECT`; plain-HTTP upstreams are forwarded in absolute form. |
+| `https` | Same, over TLS to the proxy. Trusted against `proxy_ca_pem` when set, otherwise the system pool. |
+| `socks5` | SOCKS5 tunnel with **local** DNS resolution for the target. |
+| `socks5h` | SOCKS5 with **remote** DNS resolution by the proxy. Use this when the proxy sits inside a network that can resolve names you cannot resolve from the broker. |
+
+## Failure policy
+
+The policy answers exactly one question — *what happens when the proxy itself cannot be reached*:
+
+- **`fail_closed`** (default): reject the request. Nothing silently leaks out over a direct connection, which is what you want when the proxy is carrying an egress guarantee (allowlisting, audit, DLP).
+- **`fail_open`**: log a warning and dial the target directly. Useful while migrating or shadow-testing a proxy; not suitable for enforcing egress policy.
+
+<Warning>
+  `fail_open` absorbs *only* failures reaching the proxy — refused connections,
+  TLS handshake failures against the proxy, and dead SOCKS endpoints. A failure
+  that comes from the upstream (a TLS mismatch, a DNS failure at the target, an
+  abrupt close mid-request) still fails the request. Without that distinction,
+  any upstream error would quietly become a policy bypass.
+</Warning>
+
+Requests with a body larger than 8 MB, or with a chunked (`Content-Length: -1`) body, cannot be replayed against a second connection, so those always fail closed even under `fail_open`.
+
+## Security notes
+
+- **Network policy still applies to the target.** Even when the connection is made by the proxy, the broker validates the resolved target address against the same private-range and metadata-endpoint rules used for direct dials. Attaching an upstream proxy does not disable SSRF protection.
+- **Proxy credentials stay on the proxy hop.** `Proxy-Authorization` is emitted only for the proxy and is stripped before the request continues upstream, alongside every other broker-scoped header.
+- **Trust is not widened.** A pinned `proxy_ca_pem` anchors the hop to the proxy; upstream certificates are still verified against the normal pool.
+- **Referenced profiles cannot be deleted.** Deleting a profile that services still reference returns `409` naming the referencing services, so nothing is silently re-routed.
+
+## Managing profiles
+
+<Tabs>
+  <Tab title="Web UI">
+    Go to **Manage Instance > Upstream Proxies** to create, edit, and delete
+    profiles. Only instance owners see this page. To point a service at one,
+    open the service editor and pick it from **Upstream Proxy**.
+  </Tab>
+  <Tab title="API">
+    ```bash
+    # Create the instance default profile
+    curl -X POST http://localhost:14321/v1/admin/upstream-proxies \
+      -H "Authorization: Bearer $OWNER_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "name": "corp-egress",
+        "scheme": "http",
+        "host": "proxy.corp.internal:3128",
+        "username": "svc-agent-vault",
+        "password": "…",
+        "no_proxy": "internal.corp.com,.local",
+        "on_failure": "fail_closed",
+        "is_default": true,
+        "enabled": true
+      }'
+
+    # List (never returns password material)
+    curl http://localhost:14321/v1/admin/upstream-proxies \
+      -H "Authorization: Bearer $OWNER_TOKEN"
+
+    # Update — omitted fields are left alone; clear_auth drops stored credentials
+    curl -X PATCH http://localhost:14321/v1/admin/upstream-proxies/corp-egress \
+      -H "Authorization: Bearer $OWNER_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"on_failure": "fail_open"}'
+    ```
+  </Tab>
+</Tabs>
+
+## Referencing from a service
+
+A service names the profile; everything else about the request stays the same:
+
+```yaml services.yaml
+services:
+  - name: anthropic
+    host: api.anthropic.com
+    upstream_proxy: corp-egress
+    auth:
+      type: bearer
+      token: ANTHROPIC_KEY
+```
+
+```bash
+agent-vault vault service set -f services.yaml --vault my-vault
+```
+
+Referencing a profile that does not exist is rejected with `400` at write time, so a service can never be stored mid-routed between two interpretations.
+
+<Tip>
+  A runnable end-to-end walkthrough lives in
+  [`examples/upstream-proxy-demo`](https://github.com/Infisical/agent-vault/tree/main/examples/upstream-proxy-demo).
+  It starts a logging proxy on loopback and proves each behaviour above
+  offline — including that `fail_open` really does fall back, and that target
+  failures do not.
+</Tip>

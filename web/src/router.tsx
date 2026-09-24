@@ -29,6 +29,7 @@ import InstanceLayout from "./components/InstanceLayout";
 import AccountLayout from "./components/AccountLayout";
 import AccountSettingsTab from "./pages/account/SettingsTab";
 import InstanceSettingsTab from "./pages/instance/SettingsTab";
+import InstanceUpstreamProxiesTab from "./pages/instance/UpstreamProxiesTab";
 
 // --- Types ---
 
@@ -278,6 +279,12 @@ const manageSettingsRoute = createRoute({
   component: InstanceSettingsTab,
 });
 
+const manageUpstreamProxiesRoute = createRoute({
+  getParentRoute: () => manageInstanceRoute,
+  path: "/upstream-proxies",
+  component: InstanceUpstreamProxiesTab,
+});
+
 // --- Vault Layout (sidebar) ---
 
 const vaultLayoutRoute = createRoute({
@@ -377,6 +384,7 @@ const routeTree = rootRoute.addChildren([
     manageInstanceRoute.addChildren([
       manageIndexRoute,
       manageSettingsRoute,
+      manageUpstreamProxiesRoute,
     ]),
     vaultLayoutRoute.addChildren([
       vaultIndexRoute,

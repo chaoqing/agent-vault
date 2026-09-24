@@ -229,6 +229,7 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			LogSink:          srv.LogSink(),
 			MaxResponseBytes: maxRespBytes,
 			MaxRequestBytes:  maxReqBytes,
+			UpstreamProxies:  srv.UpstreamProxyResolver(),
 		},
 	))
 	return nil

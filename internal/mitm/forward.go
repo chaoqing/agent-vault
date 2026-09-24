@@ -325,16 +325,25 @@ func (p *Proxy) forwardRequest(
 		}
 	}
 
+	// Resolve the egress route after injection so the profile can be chosen
+	// per matched service. Nothing configured → the direct baseline.
+	route, err := p.routeFor(r.Context(), scope.VaultID, inject.MatchedName, target)
+	if err != nil {
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "upstream_proxy_error", err.Error())
+		emit(http.StatusBadGateway, "upstream_proxy_error")
+		return
+	}
+
 	if wsUpgrade {
 		wsSubs := filterWebSocketSubs(inject.Substitutions)
 		if len(wsSubs) > 0 {
 			outReq.Header.Del("Sec-Websocket-Extensions")
 		}
-		p.forwardWebSocket(w, r, outReq, wsSubs, emit)
+		p.forwardWebSocket(w, r, outReq, wsSubs, emit, route)
 		return
 	}
 
-	resp, err := p.upstream.RoundTrip(outReq)
+	resp, err := p.roundTrip(outReq, route, target)
 	if err != nil {
 		p.logger.Debug("upstream request failed",
 			slog.String("vault_id", scope.VaultID),
@@ -361,7 +370,7 @@ func (p *Proxy) forwardRequest(
 			}
 			retryReq.Body = http.NoBody
 			retryReq.ContentLength = 0
-			if retryResp, retryRTErr := p.upstream.RoundTrip(retryReq); retryRTErr == nil {
+			if retryResp, retryRTErr := route.transport.RoundTrip(retryReq); retryRTErr == nil {
 				resp = retryResp
 				p.logger.Debug("oauth 401 retry succeeded",
 					slog.String("host", host),

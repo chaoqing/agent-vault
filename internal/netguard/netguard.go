@@ -160,6 +160,58 @@ func isBlockedIP(ip net.IP, allowPrivate bool, allowed []net.IPNet) bool {
 	return false
 }
 
+// currentPolicy returns the allow-private flag and allowlist in effect for
+// this process, honouring AGENT_VAULT_ALLOW_PRIVATE_RANGES and
+// AGENT_VAULT_NETWORK_ALLOWLIST. Exported helpers below read it fresh on
+// every call so runtime configuration changes are picked up.
+func currentPolicy() (bool, []net.IPNet) {
+	allowPrivate := AllowPrivateFromEnv()
+	var allowed []net.IPNet
+	if !allowPrivate {
+		allowed = AllowlistFromEnv()
+	}
+	return allowPrivate, allowed
+}
+
+// ValidateTargetName resolves host and applies the same private-range and
+// IMDS policy that direct connections enforce. It exists for egress code
+// paths (upstream proxying) where the broker does not dial the target
+// itself: the target address must still be vetted before it is handed to a
+// proxy, otherwise routing through a proxy would bypass network policy.
+//
+// Returns nil when the policy allows the host. Note that this validates the
+// addresses resolved *here*; when the proxy performs DNS resolution itself
+// (socks5h) a hostile resolver on the far side can still return an address
+// outside this check.
+func ValidateTargetName(ctx context.Context, host string) error {
+	if host == "" {
+		return fmt.Errorf("netguard: empty target host")
+	}
+	allowPrivate, allowed := currentPolicy()
+
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return fmt.Errorf("netguard: DNS lookup failed for %q: %w", host, err)
+	}
+	for _, ipAddr := range ips {
+		if isBlockedIP(ipAddr.IP, allowPrivate, allowed) {
+			return fmt.Errorf("netguard: connection to %s (%s) blocked by network policy",
+				host, ipAddr.IP.String())
+		}
+	}
+	return nil
+}
+
+// ValidateTargetAddr applies ValidateTargetName to the host portion of an
+// host:port address.
+func ValidateTargetAddr(ctx context.Context, addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("netguard: invalid address %q: %w", addr, err)
+	}
+	return ValidateTargetName(ctx, host)
+}
+
 // SafeDialContext returns a DialContext function that blocks connections to
 // forbidden IP ranges. When allowPrivate is true, only IMDS endpoints are
 // blocked. When false, private/reserved ranges are also blocked unless

@@ -14,6 +14,7 @@ import Button from "../../components/Button";
 import Input from "../../components/Input";
 import FormField from "../../components/FormField";
 import Toggle from "../../components/Toggle";
+import Select from "../../components/Select";
 import SegmentedTabs from "../../components/SegmentedTabs";
 import {
   type Auth,
@@ -22,7 +23,7 @@ import {
   SUBSTITUTION_SURFACES,
   DEFAULT_SUBSTITUTION_SURFACES,
 } from "../../components/ProposalPreview";
-import { apiFetch, apiRequest } from "../../lib/api";
+import { apiFetch, apiRequest, listUpstreamProxies } from "../../lib/api";
 
 interface Service {
   name: string;
@@ -30,6 +31,10 @@ interface Service {
   enabled?: boolean;
   auth: Auth;
   substitutions?: Substitution[];
+  // Name of an instance-level egress proxy profile. Empty/absent means
+  // "instance default, else dial the target directly". Set only by operators;
+  // proposals preserve whatever is stored.
+  upstream_proxy?: string;
 }
 
 type SubstitutionSurface = (typeof SUBSTITUTION_SURFACES)[number];
@@ -73,12 +78,17 @@ function slugifyHost(host: string): string {
 }
 
 export default function ServicesTab() {
-  const { vaultName, vaultRole } = useVaultParams();
+  const { vaultName, vaultRole, isOwner } = useVaultParams();
   const { preset: presetParam } = useSearch({ strict: false }) as { preset?: string };
   const [services, setServices] = useState<Service[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [catalog, setCatalog] = useState<CatalogTemplate[]>([]);
+  // Egress proxy profiles are instance-owned config, so only owners can list
+  // them. Non-owners still see the field — read-only, seeded with whatever
+  // references exist locally — so editing a service never silently drops an
+  // operator's egress routing.
+  const [upstreamProxyNames, setUpstreamProxyNames] = useState<string[]>([]);
   const presetApplied = useRef(false);
 
   // Add/Edit modal state: null = closed, -1 = add, 0+ = edit index
@@ -102,6 +112,9 @@ export default function ServicesTab() {
     fetchServices();
     fetchCatalog();
     fetchDiscoveredHosts();
+    if (isOwner) {
+      fetchUpstreamProxies();
+    }
   }, []);
 
   useEffect(() => {
@@ -122,6 +135,16 @@ export default function ServicesTab() {
       setCatalog(entries);
     } catch {
       // Catalog is optional — degrade silently to manual entry.
+    }
+  }
+
+  async function fetchUpstreamProxies() {
+    try {
+      const proxies = await listUpstreamProxies();
+      setUpstreamProxyNames(proxies.map((p) => p.name));
+    } catch {
+      // Owner-only and optional: the field degrades to whatever the service
+      // already references rather than blocking the edit.
     }
   }
 
@@ -422,6 +445,8 @@ export default function ServicesTab() {
           defaultAuthHeader={editingIndex === -1 ? addWithHost?.authHeader : undefined}
           defaultPreset={editingIndex === -1 && !addWithHost ? presetParam : undefined}
           catalog={catalog}
+          upstreamProxyNames={upstreamProxyNames}
+          canSelectUpstreamProxy={isOwner}
           onClose={() => {
             setEditingIndex(null);
             setAddWithHost(null);
@@ -454,6 +479,8 @@ function ServiceModal({
   defaultAuthHeader,
   defaultPreset,
   catalog,
+  upstreamProxyNames,
+  canSelectUpstreamProxy,
   onClose,
   onSave,
 }: {
@@ -465,6 +492,8 @@ function ServiceModal({
   defaultAuthHeader?: string;
   defaultPreset?: string;
   catalog: CatalogTemplate[];
+  upstreamProxyNames: string[];
+  canSelectUpstreamProxy: boolean;
   onClose: () => void;
   onSave: (service: Service) => Promise<void>;
 }) {
@@ -472,6 +501,7 @@ function ServiceModal({
   const [pattern, setPattern] = useState(initial?.host ?? defaultHost ?? "");
   const [enabled, setEnabled] = useState(initial ? initial.enabled !== false : true);
   const [authType, setAuthType] = useState<AuthType>((initial?.auth?.type as AuthType) ?? (defaultAuthScheme as AuthType) ?? "passthrough");
+  const [upstreamProxy, setUpstreamProxy] = useState(initial?.upstream_proxy ?? "");
 
   // Bearer fields
   const [token, setToken] = useState(initial?.auth?.token ?? "");
@@ -629,6 +659,14 @@ function ServiceModal({
     }
   }
 
+  // A referenced profile stays selectable even when it is absent from the
+  // caller's list, so an editor who cannot list profiles (a non-owner) still
+  // round-trips the existing value instead of clearing it.
+  const proxyOptions =
+    upstreamProxy && !upstreamProxyNames.includes(upstreamProxy)
+      ? [upstreamProxy, ...upstreamProxyNames]
+      : upstreamProxyNames;
+
   const cleanedSubs = subs
     .map((s) => ({
       key: s.key.trim(),
@@ -651,6 +689,7 @@ function ServiceModal({
         ...(enabled ? {} : { enabled: false }),
         auth: buildAuth(),
         ...(cleanedSubs.length > 0 && { substitutions: cleanedSubs }),
+        ...(upstreamProxy && { upstream_proxy: upstreamProxy }),
       };
       await onSave(service);
     } catch (err: unknown) {
@@ -724,6 +763,31 @@ function ServiceModal({
             </div>
             <Toggle checked={enabled} onChange={setEnabled} ariaLabel="Enabled" />
           </div>
+
+          {(upstreamProxy || proxyOptions.length > 0) && (
+            <FormField
+              label="Upstream Proxy"
+              tooltip="Routes this service's outbound requests through the named egress profile instead of dialing the target directly. Instance default applies when unset."
+              helperText={
+                canSelectUpstreamProxy
+                  ? undefined
+                  : "Only instance owners can change egress routing. The current profile is preserved on save."
+              }
+            >
+              <Select
+                value={upstreamProxy}
+                onChange={(e) => setUpstreamProxy(e.target.value)}
+                disabled={!canSelectUpstreamProxy}
+              >
+                <option value="">Instance default</option>
+                {proxyOptions.map((proxyName) => (
+                  <option key={proxyName} value={proxyName}>
+                    {proxyName}
+                  </option>
+                ))}
+              </Select>
+            </FormField>
+          )}
         </Section>
 
         <Section title="Authentication">

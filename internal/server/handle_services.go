@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -217,6 +218,24 @@ func (s *Server) loadServices(ctx context.Context, vaultID string) ([]broker.Ser
 	return services, nil
 }
 
+// validateUpstreamProxyRefs rejects services that name an egress proxy
+// profile that does not exist. Only the upsert path carries new names, but
+// the check runs on every write so a stale reference can never be persisted.
+func (s *Server) validateUpstreamProxyRefs(ctx context.Context, services []broker.Service) error {
+	for _, svc := range services {
+		if svc.UpstreamProxy == "" {
+			continue
+		}
+		if _, err := s.store.GetUpstreamProxyByName(ctx, svc.UpstreamProxy); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("service %q references unknown upstream proxy %q", svc.Name, svc.UpstreamProxy)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 // resolveServiceRef looks up a service by name first, then by host.
 // Returns ambiguous host matches as candidates (ok=false) for the
 // caller to surface as 409.
@@ -428,6 +447,11 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.validateUpstreamProxyRefs(ctx, existing); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	if _, err := s.store.SetBrokerConfig(ctx, ns.ID, string(servicesJSON)); err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to set services")
 		return
@@ -590,6 +614,11 @@ func (s *Server) handleServicePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.validateUpstreamProxyRefs(ctx, services); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	if _, err := s.store.SetBrokerConfig(ctx, ns.ID, string(servicesJSON)); err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to update services")
 		return
@@ -646,6 +675,11 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 	servicesJSON, err := json.Marshal(services)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to marshal services")
+		return
+	}
+
+	if err := s.validateUpstreamProxyRefs(ctx, services); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 

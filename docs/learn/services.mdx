@@ -10,6 +10,7 @@ Each service contains:
 - **Name**: A canonical per-vault identifier (slug, 3–64 lowercase alphanumeric/hyphen chars, no leading/trailing hyphen, no consecutive hyphens). **Required on write** for new services — pick a deliberate name like `stripe`, `slack-bot`, or `internal-billing`. `name` may be omitted only when `host` + `path` uniquely matches an existing service (the server adopts that service's name, the same pattern as host-based delete). Legacy services persisted without a name before this contract are auto-slugified from `host` + `path` on read so they remain addressable; the slug becomes durable on the next write.
 - **Host**: The single matcher field. Accepts a bare hostname (`api.stripe.com`), a one-level wildcard (`*.github.com`), an inline path-scoped form (`slack.com/api/*`), or a port-scoped form (`internal.corp.com:3000` or `internal.corp.com:3000/api/*`). When a port is included, the service matches only traffic to that port; without a port, the service matches any port. Reads and writes use the same shape: writes accept any of those forms; reads return the joined inline form so you see exactly what you wrote.
 - **Auth config**: How Agent Vault authenticates. Five types are supported: `bearer`, `basic`, `api-key`, `custom`, and `passthrough` (opt out of injection).
+- **Upstream proxy**: Optional name of an instance-level [upstream proxy](/learn/upstream-proxies) profile that carries this service's requests to the real API. Empty means "instance default, else dial the target directly".
 
 <Tip>
   The `/discover` endpoint returns each service's `name` and `host` (joined
@@ -42,6 +43,28 @@ agent-vault vault service set -f stripe-services.yaml --vault my-vault
 ```
 
 The `host` tells Agent Vault which requests this service applies to. The `auth` block tells Agent Vault how to authenticate, referencing [credential](/learn/credentials) keys by name (not the actual credential values). The following section covers all five auth types.
+
+## Upstream proxy
+
+By default Agent Vault dials the target directly. Reference an [upstream proxy](/learn/upstream-proxies) profile to send the request through an operator-configured egress hop instead:
+
+```yaml stripe-services.yaml
+services:
+  - name: stripe
+    host: api.stripe.com
+    upstream_proxy: corp-egress
+    auth:
+      type: bearer
+      token: STRIPE_KEY
+```
+
+The value is a profile name managed by instance owners (**Manage Instance > Upstream Proxies**), never an inline URL — credentials and trust anchors live on the profile, so rotating egress for ten services is one edit. A reference to a profile that does not exist is rejected with `400` at write time, and deleting a profile while services still reference it is refused with `409`.
+
+<Tip>
+  Agents cannot change egress routing. A [proposal](/learn/proposals) that adds
+  or edits a service keeps whatever `upstream_proxy` is already stored, so an
+  agent can neither introduce nor drop routing for a service it does not own.
+</Tip>
 
 ## Auth types
 
