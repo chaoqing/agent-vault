@@ -144,6 +144,10 @@ func (s *Server) handleCreateUpstreamProxy(w http.ResponseWriter, r *http.Reques
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := egress.ValidateProxyCAPEM(req.ProxyCAPEM); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	p := &store.UpstreamProxy{
 		Name:       req.Name,
@@ -248,6 +252,10 @@ func (s *Server) handleUpdateUpstreamProxy(w http.ResponseWriter, r *http.Reques
 		params.NoProxy = req.NoProxy
 	}
 	if req.ProxyCAPEM != nil {
+		if err := egress.ValidateProxyCAPEM(*req.ProxyCAPEM); err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		params.ProxyCAPEM = req.ProxyCAPEM
 	}
 	if req.OnFailure != nil {
@@ -267,21 +275,38 @@ func (s *Server) handleUpdateUpstreamProxy(w http.ResponseWriter, r *http.Reques
 		var nilBytes []byte
 		params.UsernameCT, params.UsernameNonce = &nilBytes, &nilBytes
 		params.PasswordCT, params.PasswordNonce = &nilBytes, &nilBytes
-	} else if req.Password != nil || req.Username != nil {
+	} else if req.Username != nil && req.Password == nil {
+		// Username-only PATCH. The password is write-only (never decrypted
+		// back out for display), so the only way to preserve it across an
+		// update is to reuse the stored ciphertext directly rather than
+		// re-encrypting a value we do not have. Re-encrypting an empty
+		// password here would silently clear authentication.
+		uct, unonce, err := crypto.Encrypt([]byte(*req.Username), s.encKey)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "Encryption failed")
+			return
+		}
+		params.UsernameCT, params.UsernameNonce = &uct, &unonce
+		if len(existing.PasswordCT) > 0 {
+			existingPass := existing.PasswordCT
+			existingNonce := existing.PasswordNonce
+			params.PasswordCT, params.PasswordNonce = &existingPass, &existingNonce
+		}
+		// When the profile had no password, leaving PasswordCT/Nonce nil keeps
+		// the store's "no credentials" state untouched.
+	} else if req.Password != nil {
+		// Password present (with or without a username). A provided username
+		// replaces the old one; an omitted one keeps the decrypted old value.
 		user := s.decryptToString(existing.UsernameCT, existing.UsernameNonce)
 		if req.Username != nil {
 			user = *req.Username
-		}
-		pass := ""
-		if req.Password != nil {
-			pass = *req.Password
 		}
 		uct, unonce, err := crypto.Encrypt([]byte(user), s.encKey)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, "Encryption failed")
 			return
 		}
-		ct, nonce, err := crypto.Encrypt([]byte(pass), s.encKey)
+		ct, nonce, err := crypto.Encrypt([]byte(*req.Password), s.encKey)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, "Encryption failed")
 			return

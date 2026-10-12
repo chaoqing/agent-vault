@@ -211,3 +211,81 @@ func TestUpstreamProxyDeleteRefusesWhenReferenced(t *testing.T) {
 		t.Fatalf("proxy survived deletion: %v", err)
 	}
 }
+
+// M3: deletion protection must use the same exact-match rule as lookup and
+// resolution. A service referencing a differently-cased name is not a real
+// reference (it would fail lookup), so it must not block deletion either.
+func TestUpstreamProxyReferenceCountExactName(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if err := s.CreateUpstreamProxy(ctx, &UpstreamProxy{Name: "corp", Scheme: "http", Host: "a:3128", OnFailure: "fail_closed", Enabled: true}); err != nil {
+		t.Fatalf("CreateUpstreamProxy: %v", err)
+	}
+
+	vault, err := s.CreateVault(ctx, "demo")
+	if err != nil {
+		t.Fatalf("CreateVault: %v", err)
+	}
+	// Service references "CORP" (case differs from stored "corp"). Under the
+	// exact-match contract this is NOT a valid reference: GetUpstreamProxyByName
+	// would not find it, so deletion of "corp" must not be blocked by it.
+	services := `[{"name":"a","host":"api.a.com","auth":{"type":"passthrough"},"upstream_proxy":"CORP"}]`
+	if _, err := s.SetBrokerConfig(ctx, vault.ID, services); err != nil {
+		t.Fatalf("seeding broker config: %v", err)
+	}
+
+	refs, err := s.CountUpstreamProxyReferences(ctx, "corp")
+	if err != nil {
+		t.Fatalf("CountUpstreamProxyReferences: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("mismatched-case reference counted as a real one: %v", refs)
+	}
+}
+
+// M1: GetDefaultUpstreamProxy must return a deterministic row even when the
+// table transiently holds more than one default (the partial unique index
+// prevents this in steady state, but the read must not depend on storage
+// order). We seed two defaults directly and assert it returns exactly one,
+// applying ORDER BY created_at rather than an arbitrary row.
+func TestGetDefaultUpstreamProxyOrderingDeterministic(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	insert := func(name, host string, createTS string) error {
+		_, err := s.db.ExecContext(ctx, `INSERT INTO upstream_proxies (
+			id, name, scheme, host, username_ct, username_nonce, password_ct, password_nonce,
+			no_proxy, proxy_ca_pem, on_failure, is_default, enabled, created_at, updated_at
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			"id-"+name, name, "http", host, nil, nil, nil, nil,
+			"", "", "fail_closed", 1, 1, createTS, createTS)
+		return err
+	}
+
+	// M1's database-level guard: the partial unique index must refuse a
+	// second row marked default, even when inserted directly (bypassing the
+	// application's clear-then-set which would have masked the collision).
+	if err := insert("db-default-a", "a:3128", "2026-01-01 00:00:00"); err != nil {
+		t.Fatalf("insert first default: %v", err)
+	}
+	err := insert("db-default-b", "b:3128", "2026-01-02 00:00:00")
+	if err == nil {
+		t.Fatal("second default row must be rejected by the single-default index")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "unique") {
+		t.Fatalf("second default rejected for the wrong reason: %v (want a UNIQUE constraint violation)", err)
+	}
+
+	// With exactly one default present, the read returns it.
+	p, err := s.GetDefaultUpstreamProxy(ctx)
+	if err != nil {
+		t.Fatalf("GetDefaultUpstreamProxy: %v", err)
+	}
+	if p == nil {
+		t.Fatal("expected a default upstream proxy")
+	}
+	if p.Name != "db-default-a" {
+		t.Fatalf("default = %q, want db-default-a", p.Name)
+	}
+}

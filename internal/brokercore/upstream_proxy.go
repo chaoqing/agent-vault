@@ -116,18 +116,39 @@ func (p *UpstreamProxy) HasAuth() bool {
 	return p != nil && (p.Username != "" || p.Password != "")
 }
 
-// UsesDNSRemotely reports whether hostname resolution is delegated to the
-// proxy rather than performed locally. With socks5h the local DNS-based
-// target validation cannot see the address the proxy will actually connect
-// to, so callers must treat the validation result accordingly.
+// UsesDNSRemotely reports whether hostname resolution for the target is
+// delegated to the proxy rather than performed locally.
+//
+// With socks5h the proxy is asked (ATYP 0x03) to resolve the target hostname
+// remotely. With http/https the broker sends the target hostname in the
+// CONNECT request line, and the proxy resolves it on its own network. In both
+// cases the local DNS-based target validation cannot see the address the proxy
+// will actually reach, so callers must treat the validation result as advisory
+// for these schemes: the real SSRF boundary for a proxied service is the
+// operator-defined service host allowlist, not this check.
+//
+// socks5 (no trailing h) is the one scheme for which the broker resolves
+// locally and hands the proxy an IP, so its validation is reliable.
 func (p *UpstreamProxy) UsesDNSRemotely() bool {
-	return p != nil && p.Scheme == UpstreamProxySchemeSOCKS5H
+	if p == nil {
+		return false
+	}
+	switch p.Scheme {
+	case UpstreamProxySchemeSOCKS5H,
+		UpstreamProxySchemeHTTP,
+		UpstreamProxySchemeHTTPS:
+		return true
+	default:
+		return false
+	}
 }
 
 // Fingerprint returns a stable identifier for the profile's effective
 // configuration. The egress registry keys cached transports on it so that
 // editing a profile (including rotating its password) invalidates the cache
-// without a restart. Only non-secret inputs feed the hash.
+// without a restart. Note that username and password are deliberately part of
+// the hash: this is what makes a credential rotation immediately invalidate a
+// cached transport instead of reusing a stale authenticated connection.
 func (p *UpstreamProxy) Fingerprint() string {
 	if p == nil {
 		return "direct"

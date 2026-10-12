@@ -56,7 +56,7 @@ func (s *SQLStore) GetUpstreamProxyByName(ctx context.Context, name string) (*Up
 // sql.ErrNoRows when none is marked default or the marked one is disabled.
 func (s *SQLStore) GetDefaultUpstreamProxy(ctx context.Context) (*UpstreamProxy, error) {
 	row := s.db.QueryRowContext(ctx,
-		"SELECT "+upstreamProxyColumns+" FROM upstream_proxies WHERE is_default = ? AND enabled = ?",
+		"SELECT "+upstreamProxyColumns+" FROM upstream_proxies WHERE is_default = ? AND enabled = ? ORDER BY created_at LIMIT 1",
 		s.dialect.BoolVal(true), s.dialect.BoolVal(true))
 	p, err := s.scanUpstreamProxy(row)
 	if err != nil {
@@ -229,7 +229,7 @@ func (s *SQLStore) CountUpstreamProxyReferences(ctx context.Context, name string
 			continue
 		}
 		for _, svc := range services {
-			if strings.EqualFold(svc.UpstreamProxy, name) {
+			if svc.UpstreamProxy == name {
 				refs = append(refs, fmt.Sprintf("%s/%s", vaultName, svc.Name))
 			}
 		}

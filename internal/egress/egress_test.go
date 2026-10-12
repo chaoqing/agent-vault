@@ -1,10 +1,14 @@
 package egress
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -633,5 +637,103 @@ func TestUnreachableProxySurfacesAnError(t *testing.T) {
 	}
 	if got := blackhole.ConnectionCount(); got == 0 {
 		t.Fatal("expected at least one connection attempt to the dead proxy")
+	}
+}
+
+// TestRemoteDNSProfileWarnsOnce locks in the advisory log for profiles whose
+// target hostname is resolved by the proxy itself (http/https CONNECT and
+// socks5h). Local target validation cannot see the address the proxy will
+// actually reach, so the warning is the only signal an operator gets that the
+// SSRF boundary is advisory for this profile — and it must fire exactly once
+// per fingerprint, not on every request.
+func TestRemoteDNSProfileWarnsOnce(t *testing.T) {
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	r := NewRegistry(baseFactory(nil), logger, true)
+
+	// socks5h resolves the target remotely -> must warn.
+	p := testProfile("remote-dns", brokercore.UpstreamProxySchemeSOCKS5H, "127.0.0.1:9999")
+	if !p.UsesDNSRemotely() {
+		t.Fatal("socks5h profile must be flagged as resolving DNS remotely")
+	}
+	if _, err := r.Transport(p); err == nil {
+		// Transport construction succeeds even for an unreachable proxy
+		// (the proxy is only contacted when a request is issued); the warn
+		// fires during construction, which is what we assert here.
+	}
+
+	// A second construction of the same fingerprint must not warn again.
+	if _, err := r.Transport(p); err == nil {
+	}
+
+	warns := strings.Count(buf.String(), "egress proxy resolves the target hostname itself")
+	if warns != 1 {
+		t.Fatalf("expected exactly 1 remote-DNS advisory warning, got %d (log: %q)", warns, buf.String())
+	}
+
+	// A plain socks5 (local DNS) profile must never warn.
+	buf.Reset()
+	local := testProfile("local-dns", brokercore.UpstreamProxySchemeSOCKS5, "127.0.0.1:9999")
+	if local.UsesDNSRemotely() {
+		t.Fatal("socks5 (local DNS) must not be flagged as resolving remotely")
+	}
+	_, _ = r.Transport(local)
+	if strings.Contains(buf.String(), "resolves the target hostname") {
+		t.Fatalf("socks5 profile must not trigger remote-DNS warning: %q", buf.String())
+	}
+}
+
+// M4: a non-empty ProxyCAPEM that is not a valid PEM certificate must be a
+// configuration error surfaced by Validate, not silently accepted (which would
+// later fall back to system roots without telling the operator).
+func TestValidateProxyCAPEMRejectsNonCert(t *testing.T) {
+	base := func(name, scheme, host string) *brokercore.UpstreamProxy {
+		return testProfile(name, scheme, host)
+	}
+
+	// A real, valid certificate from egresstest so the positive case exercises
+	// AppendCertsFromPEM with genuine bytes.
+	validPEM := egresstest.NewHTTPSProxy(t, "", "").PEM()
+	if validPEM == "" {
+		t.Fatal("egresstest HTTPS proxy must expose a certificate PEM")
+	}
+
+	// A genuine PKCS#8 private key block — a real PEM that is *not* a
+	// certificate, so the negative case exercises "valid PEM but wrong type"
+	// rather than merely "garbage".
+	_, privKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate test private key: %v", err)
+	}
+	privDER, err := x509.MarshalPKCS8PrivateKey(privKey)
+	if err != nil {
+		t.Fatalf("marshal private key: %v", err)
+	}
+	privKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
+
+	for _, tc := range []struct {
+		name string
+		pem  string
+		ok   bool
+	}{
+		{"empty ok", "", true},
+		{"whitespace ok", "   \n	 ", true},
+		{"valid cert ok", validPEM, true},
+		{"garbage pem", "not a pem at all", false},
+		{"truncated cert rejected", "-----BEGIN CERTIFICATE-----\n", false},
+		{"private key is not a cert", string(privKeyPEM), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := base(tc.name, "http", "proxy:3128")
+			p.ProxyCAPEM = tc.pem
+			err := Validate(p)
+			if tc.ok && err != nil {
+				t.Fatalf("Validate() = %v, want nil for %q", err, tc.name)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("Validate() = nil, want error for %q", tc.name)
+			}
+		})
 	}
 }

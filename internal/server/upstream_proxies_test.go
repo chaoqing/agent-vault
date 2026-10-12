@@ -244,6 +244,60 @@ func TestUpstreamProxyRotationKeepsUsernameWhenOnlyPasswordChanges(t *testing.T)
 	}
 }
 
+// A username-only PATCH must not silently clear the password. The password is
+// write-only, so an operator changing the login name has no way to notice a
+// coincidental empty-password rewrite; the update must preserve the stored
+// ciphertext instead of re-encrypting an empty value.
+func TestUpstreamProxyUsernameOnlyPatchPreservesPassword(t *testing.T) {
+	ms, ownerToken := setupMockStoreWithSession(t)
+	srv := newTestServer(withStore(ms))
+
+	rec := proxyRequest(t, srv, http.MethodPost, "/v1/admin/upstream-proxies", ownerToken,
+		`{"name":"corp","scheme":"http","host":"proxy.internal:3128","username":"old-user","password":"hunter2","on_failure":"fail_closed"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+	}
+	stored := ms.upstreamProxies["corp"]
+	originalPassCT := append([]byte(nil), stored.PasswordCT...)
+	if len(originalPassCT) == 0 {
+		t.Fatal("password was not stored encrypted")
+	}
+
+	// Change only the username.
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"username":"new-user"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("username-only patch = %d: %s", rec.Code, rec.Body.String())
+	}
+	updated := decodeProxyView(t, rec)
+	if updated.Username != "new-user" {
+		t.Fatalf("username after patch = %q, want new-user", updated.Username)
+	}
+	if !updated.HasAuth {
+		t.Fatal("has_auth = false after a username-only patch; the password must survive")
+	}
+	// The stored password ciphertext must be byte-for-byte untouched.
+	after := ms.upstreamProxies["corp"]
+	if string(after.PasswordCT) != string(originalPassCT) {
+		t.Fatal("password ciphertext changed on a username-only patch; password must be preserved")
+	}
+	if string(after.PasswordNonce) != string(stored.PasswordNonce) {
+		t.Fatal("password nonce changed on a username-only patch; password must be preserved")
+	}
+
+	// Rotating the password must still work after the username-only rewrite.
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"password":"new-pass"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("password rotation after username patch = %d: %s", rec.Code, rec.Body.String())
+	}
+	final := decodeProxyView(t, rec)
+	if final.Username != "new-user" {
+		t.Fatalf("username after rotation = %q, want new-user preserved", final.Username)
+	}
+	if !final.HasAuth {
+		t.Fatal("has_auth = false after rotation, want true")
+	}
+}
+
 func TestUpstreamProxyUpdateRejectsBadInput(t *testing.T) {
 	ms, ownerToken := setupMockStoreWithSession(t)
 	srv := newTestServer(withStore(ms))

@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -24,6 +27,18 @@ import (
 // one lookup while keeping operator edits (which invalidate the cache
 // explicitly) visible within seconds even if invalidation is missed.
 const upstreamProxyCacheTTL = 5 * time.Second
+
+// maxUpstreamProxyCacheEntries bounds the resolver cache so the map cannot
+// grow without limit across vaults and service names even after entries
+// expire (patience: a freshly-invalidated cache is rebuilt from scratch; the
+// cap keeps steady-state memory flat).
+const maxUpstreamProxyCacheEntries = 4096
+
+// failOpenReplayBytes caps how much of a control-plane request body is held in
+// memory purely so a fail_open profile can replay the request directly after a
+// failed proxy hop. Above this the request keeps the "honour the proxy or
+// fail" behaviour.
+const failOpenReplayBytes = 8 << 20
 
 // upstreamProxyResolver resolves the egress proxy for a single brokered
 // request. Precedence is: the profile named by the matched service, then the
@@ -81,9 +96,32 @@ func (r *upstreamProxyResolver) ResolveUpstreamProxy(ctx context.Context, vaultI
 	}
 
 	r.mu.Lock()
-	r.cache[key] = cachedUpstreamProxy{proxy: proxy, expiresAt: time.Now().Add(upstreamProxyCacheTTL)}
+	r.setCacheLocked(key, proxy)
 	r.mu.Unlock()
 	return proxy, nil
+}
+
+// setCacheLocked stores key→proxy, enforcing maxUpstreamProxyCacheEntries.
+// When the map is at capacity it first drops expired entries; if it is still
+// at capacity (all entries live) it declines to cache rather than grow without
+// bound. Callers hold r.mu.
+func (r *upstreamProxyResolver) setCacheLocked(key string, proxy *brokercore.UpstreamProxy) {
+	if len(r.cache) >= maxUpstreamProxyCacheEntries {
+		// Opportunistic sweep of expired entries.
+		now := time.Now()
+		for k, v := range r.cache {
+			if !now.Before(v.expiresAt) {
+				delete(r.cache, k)
+			}
+		}
+		if len(r.cache) >= maxUpstreamProxyCacheEntries {
+			// Still full of live entries; skipping the write is better than
+			// unbounded growth. The entry just degrades to a per-request
+			// resolution until an admin change rebuilds the cache.
+			return
+		}
+	}
+	r.cache[key] = cachedUpstreamProxy{proxy: proxy, expiresAt: time.Now().Add(upstreamProxyCacheTTL)}
 }
 
 func (r *upstreamProxyResolver) resolve(ctx context.Context, vaultID, serviceName string) (*brokercore.UpstreamProxy, error) {
@@ -145,6 +183,9 @@ func (r *upstreamProxyResolver) serviceProxyName(ctx context.Context, vaultID, s
 	if err := json.Unmarshal([]byte(bc.ServicesJSON), &services); err != nil {
 		return "", err
 	}
+	// Normalize names the same way the service handlers do so a stored
+	// service with an empty Name still matches by its assigned slug.
+	broker.AssignSlugNames(services)
 	for _, svc := range services {
 		if svc.Name == serviceName && svc.UpstreamProxy != "" {
 			return svc.UpstreamProxy, nil
@@ -206,7 +247,16 @@ type egressRoundTripper struct {
 
 func (t *egressRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	profile, err := t.resolver.ResolveUpstreamProxy(req.Context(), "", "")
-	if err != nil || profile == nil {
+	if err != nil {
+		// A resolution failure is a broker-side fault, not a licence to
+		// route around the egress policy. Returning the error keeps the
+		// operator's fail_closed promise intact instead of silently
+		// dialling directly.
+		return nil, fmt.Errorf("control-plane egress resolution failed: %w", err)
+	}
+	if profile == nil {
+		// No default profile configured: direct is the pre-feature
+		// behaviour and is exactly right.
 		return t.base.RoundTrip(req)
 	}
 	if egress.Bypass(profile.NoProxy, req.URL.Host) {
@@ -214,13 +264,60 @@ func (t *egressRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	}
 	transport, err := t.registry.Transport(profile)
 	if err != nil {
-		t.logger.Warn("control-plane egress proxy unusable; dialling directly",
+		if profile.FailureMode() != brokercore.UpstreamProxyFailOpen {
+			// fail_closed: an unusable proxy must not silently leak a
+			// control-plane request onto a direct connection.
+			return nil, fmt.Errorf("control-plane egress proxy %q is unusable: %w", profile.Name, err)
+		}
+		t.logger.Warn("control-plane egress proxy unusable; dialling directly under fail_open",
 			slog.String("profile", profile.Name),
 			slog.String("host", req.URL.Host),
 			slog.String("error", err.Error()))
 		return t.base.RoundTrip(req)
 	}
-	return transport.RoundTrip(req)
+	resp, err := transport.RoundTrip(req)
+	// Only failures tagged as reaching *the proxy itself* are eligible for the
+	// fail_open fallback; anything else (upstream TLS, DNS at the target) is
+	// returned untouched so a proxy-side success can never become a hint to
+	// bypass policy.
+	if err == nil || profile.FailureMode() != brokercore.UpstreamProxyFailOpen ||
+		!errors.Is(err, egress.ErrProxyUnreachable) {
+		return resp, err
+	}
+	if !t.replayableBody(req) {
+		return resp, err
+	}
+	t.logger.Warn("control-plane egress proxy unreachable; dialling directly under fail_open",
+		slog.String("profile", profile.Name),
+		slog.String("host", req.URL.Host),
+		slog.String("error", err.Error()))
+	return t.base.RoundTrip(req)
+}
+
+// replayableBody reports whether req's body can be sent a second time. Control
+// plane calls are small, so bodies are buffered when they are small enough and
+// never replayed when chunked or oversized — a half-sent re-dial is worse than
+// an honest failure.
+func (t *egressRoundTripper) replayableBody(req *http.Request) bool {
+	if req.Body == nil {
+		return true
+	}
+	if req.GetBody != nil {
+		return true
+	}
+	if req.ContentLength < 0 || req.ContentLength > failOpenReplayBytes {
+		return false
+	}
+	data, err := io.ReadAll(req.Body)
+	if err != nil {
+		return false
+	}
+	_ = req.Body.Close()
+	req.Body = io.NopCloser(bytes.NewReader(data))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(data)), nil
+	}
+	return true
 }
 
 // ControlPlaneRoundTripper wraps base so control-plane HTTP calls honour the
@@ -260,11 +357,25 @@ func (s *Server) controlPlaneEgress() *egress.Registry {
 func (s *Server) controlPlaneDial() func(network, addr string) (net.Conn, error) {
 	return func(network, addr string) (net.Conn, error) {
 		profile, err := s.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
-		if err != nil || profile == nil {
+		if err != nil {
+			return nil, fmt.Errorf("control-plane egress resolution failed: %w", err)
+		}
+		if profile == nil {
 			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(context.Background(), network, addr)
 		}
 		if profile.Scheme != brokercore.UpstreamProxySchemeSOCKS5 && profile.Scheme != brokercore.UpstreamProxySchemeSOCKS5H {
-			s.logger.Warn("SMTP cannot use an HTTP upstream proxy in this release; dialling directly",
+			// SMTP cannot ride an HTTP CONNECT proxy in this release. Dialling
+			// directly here would silently bypass the egress policy for email
+			// (case approvals, invites): under fail_closed that is exactly the
+			// path an enforced-egress deployment exists to seal, so refuse.
+			if profile.FailureMode() == brokercore.UpstreamProxyFailClosed {
+				s.logger.Error("SMTP cannot use an HTTP upstream proxy; refusing to dial directly under fail_closed",
+					slog.String("profile", profile.Name),
+					slog.String("scheme", profile.Scheme))
+				return nil, fmt.Errorf("egress: SMTP cannot be sent through %q proxy profile %q (scheme %s); refusing to bypass egress under fail_closed",
+					profile.Scheme, profile.Name, profile.Scheme)
+			}
+			s.logger.Warn("SMTP cannot use an HTTP upstream proxy; dialling directly under fail_open",
 				slog.String("profile", profile.Name),
 				slog.String("scheme", profile.Scheme))
 			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(context.Background(), network, addr)

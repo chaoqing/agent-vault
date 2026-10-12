@@ -119,8 +119,9 @@ var privateRanges = []net.IPNet{
 	parseCIDR("fe80::/10"),
 	// IPv6 unique local
 	parseCIDR("fc00::/7"),
-	// 0.0.0.0 (often routes to localhost)
+	// 0.0.0.0 and :: (unspecified; connecting to them reaches localhost)
 	parseCIDR("0.0.0.0/32"),
+	parseCIDR("::/128"),
 }
 
 func parseCIDR(s string) net.IPNet {
@@ -212,31 +213,35 @@ func ValidateTargetAddr(ctx context.Context, addr string) error {
 	return ValidateTargetName(ctx, host)
 }
 
-// SafeDialContext returns a DialContext function that blocks connections to
-// forbidden IP ranges. When allowPrivate is true, only IMDS endpoints are
-// blocked. When false, private/reserved ranges are also blocked unless
-// allowlisted via AGENT_VAULT_NETWORK_ALLOWLIST.
+// SafeDialContext returns a DialContext function that both enforces network
+// policy and is safe against DNS rebinding. It resolves the hostname, checks
+// every candidate address, then dials the validated addresses — trying each
+// in order so a CDN/multi-A host still falls back to a later address instead
+// of failing on the first — while handing the dialer a concrete IP rather
+// than the hostname, which closes the validate-then-re-resolve TOCTOU.
+//
+// The allowlist is re-read on every dial (not captured at construction) so a
+// runtime change to AGENT_VAULT_ALLOW_PRIVATE_RANGES /
+// AGENT_VAULT_NETWORK_ALLOWLIST takes effect for cached transports too.
 func SafeDialContext(allowPrivate bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	dialer := &net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
-	var allowed []net.IPNet
-	if !allowPrivate {
-		allowed = AllowlistFromEnv()
-	}
-
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, fmt.Errorf("netguard: invalid address %q: %w", addr, err)
 		}
 
+		var allowed []net.IPNet
+		if !allowPrivate {
+			allowed = AllowlistFromEnv()
+		}
+
 		// Resolve the hostname to IP addresses.
 		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if err != nil {
 			return nil, fmt.Errorf("netguard: DNS lookup failed for %q: %w", host, err)
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("netguard: DNS lookup returned no addresses for %q", host)
 		}
 
 		// Check all resolved IPs before connecting.
@@ -247,8 +252,21 @@ func SafeDialContext(allowPrivate bool) func(ctx context.Context, network, addr 
 			}
 		}
 
-		// All IPs are safe — connect directly to a validated IP to prevent
-		// DNS rebinding (TOCTOU: a second resolution could return a different IP).
-		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		// Dial a validated, concrete IP (never the hostname, so a second
+		// resolution cannot swap in an unchecked address). Try each candidate
+		// in order to retain multi-address failover.
+		var lastErr error
+		for _, ipAddr := range ips {
+			dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+			conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ipAddr.IP.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+		}
+		return nil, fmt.Errorf("netguard: all resolved addresses for %q failed: %w", host, lastErr)
 	}
 }

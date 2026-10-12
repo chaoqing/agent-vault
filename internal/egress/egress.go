@@ -71,6 +71,24 @@ func Validate(p *brokercore.UpstreamProxy) error {
 	if err := ValidateHost(p.Host); err != nil {
 		return err
 	}
+	if err := ValidateProxyCAPEM(p.ProxyCAPEM); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateProxyCAPEM accepts empty configuration (use the system trust store)
+// or a non-empty block of PEM CERTIFICATE entries. Malformed or non-empty
+// non-certificate data is a configuration error so the proxy is not silently
+// handed the system roots instead of the operator's private CA.
+func ValidateProxyCAPEM(pem string) error {
+	if strings.TrimSpace(pem) == "" {
+		return nil
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM([]byte(pem)) {
+		return fmt.Errorf("egress: upstream proxy CA is not a valid PEM certificate")
+	}
 	return nil
 }
 
@@ -174,6 +192,10 @@ type Registry struct {
 	mu         sync.RWMutex
 	transports map[string]*http.Transport
 	tunnels    map[string]TunnelDialer
+	// warnedRemoteDNS records profile fingerprints for which the remote-DNS
+	// advisory warning has already been emitted, so it fires once per profile
+	// rather than once per request.
+	warnedRemoteDNS map[string]bool
 }
 
 // NewRegistry wraps factory-built transports configured by profile. When
@@ -184,11 +206,12 @@ func NewRegistry(factory TransportFactory, logger *slog.Logger, validate bool) *
 		logger = slog.New(slog.DiscardHandler)
 	}
 	return &Registry{
-		base:       factory,
-		logger:     logger,
-		validate:   validate,
-		transports: make(map[string]*http.Transport),
-		tunnels:    make(map[string]TunnelDialer),
+		base:            factory,
+		logger:          logger,
+		validate:        validate,
+		transports:      make(map[string]*http.Transport),
+		tunnels:         make(map[string]TunnelDialer),
+		warnedRemoteDNS: make(map[string]bool),
 	}
 }
 
@@ -290,7 +313,27 @@ func (r *Registry) buildTransport(p *brokercore.UpstreamProxy) (*http.Transport,
 	default:
 		return nil, fmt.Errorf("egress: unsupported upstream proxy scheme %q", p.Scheme)
 	}
+	r.warnRemoteDNS(p)
 	return tr, nil
+}
+
+// warnRemoteDNS emits a one-time advisory warning for profiles whose target
+// hostname is resolved by the proxy itself (see UsesDNSRemotely). Local target
+// validation cannot see the address the proxy will actually reach, so an
+// operator relying on it as an SSRF boundary deserves to know. Callers hold
+// r.mu; the call is a no-op for already-warned fingerprints.
+func (r *Registry) warnRemoteDNS(p *brokercore.UpstreamProxy) {
+	if p == nil || !p.UsesDNSRemotely() {
+		return
+	}
+	key := p.Fingerprint()
+	if r.warnedRemoteDNS[key] {
+		return
+	}
+	r.warnedRemoteDNS[key] = true
+	r.logger.Warn("egress proxy resolves the target hostname itself; local network-policy validation is advisory for this profile",
+		slog.String("profile", p.Name),
+		slog.String("scheme", p.Scheme))
 }
 
 // applyHTTPProxy wires a CONNECT-capable HTTP proxy into tr. The Proxy hook
@@ -389,18 +432,22 @@ func (r *Registry) proxyTLSConfig(p *brokercore.UpstreamProxy) *tls.Config {
 // would apply.
 func (r *Registry) proxyOrDirect(p *brokercore.UpstreamProxy) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	hop := r.proxyTCP(p)
-	direct := &net.Dialer{Timeout: proxyDialTimeout, KeepAlive: 30 * time.Second}
+	// The direct leg is dialled through SafeDialContext: it resolves the
+	// host, validates every candidate IP against network policy, and then
+	// connects to a single locked IP. That closes the DNS-rebinding TOCTOU
+	// a raw second resolution inside net.Dialer would reintroduce between
+	// the validation here and the connection itself.
+	safeDirect := netguard.SafeDialContext(netguard.AllowPrivateFromEnv())
+	rawDirect := (&net.Dialer{Timeout: proxyDialTimeout, KeepAlive: 30 * time.Second}).DialContext
 
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if addr == p.Host {
 			return hop(ctx, network, addr)
 		}
-		if r.validate {
-			if err := netguard.ValidateTargetAddr(ctx, addr); err != nil {
-				return nil, err
-			}
+		if !r.validate {
+			return rawDirect(ctx, network, addr)
 		}
-		return direct.DialContext(ctx, network, addr)
+		return safeDirect(ctx, network, addr)
 	}
 }
 
@@ -542,23 +589,24 @@ func (r *Registry) wrapTargetPolicy(p *brokercore.UpstreamProxy, dialer proxy.Di
 }
 
 func (r *Registry) buildTunnel(p *brokercore.UpstreamProxy) (TunnelDialer, error) {
+	var dialer TunnelDialer
 	switch p.Scheme {
 	case brokercore.UpstreamProxySchemeSOCKS5, brokercore.UpstreamProxySchemeSOCKS5H:
-		dialer, err := r.socksDialer(p)
+		d, err := r.socksDialer(p)
 		if err != nil {
 			return nil, err
 		}
-		dial := r.wrapTargetPolicy(p, dialer)
-		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dial := r.wrapTargetPolicy(p, d)
+		dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dial(ctx, network, addr)
-		}, nil
+		}
 
 	case brokercore.UpstreamProxySchemeHTTP, brokercore.UpstreamProxySchemeHTTPS:
 		// Always the proxy hop: unlike the transport path, nothing has
 		// decided whether to bypass yet, and a tunnel exists precisely
 		// because the caller wants the target reached through the proxy.
 		dialProxy := r.dialProxyHop(p)
-		return func(ctx context.Context, _, addr string) (net.Conn, error) {
+		dialer = func(ctx context.Context, _, addr string) (net.Conn, error) {
 			if r.validate {
 				if err := netguard.ValidateTargetAddr(ctx, addr); err != nil {
 					return nil, err
@@ -573,11 +621,13 @@ func (r *Registry) buildTunnel(p *brokercore.UpstreamProxy) (TunnelDialer, error
 				return nil, err
 			}
 			return conn, nil
-		}, nil
+		}
 
 	default:
 		return nil, fmt.Errorf("egress: unsupported upstream proxy scheme %q", p.Scheme)
 	}
+	r.warnRemoteDNS(p)
+	return dialer, nil
 }
 
 // connectTunnel issues CONNECT over an existing connection to the proxy and

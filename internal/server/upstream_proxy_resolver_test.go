@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -260,6 +263,84 @@ func TestResolverCacheExpires(t *testing.T) {
 	}
 }
 
+func TestResolverCacheBounded(t *testing.T) {
+	srv := newTestServer(withStore(newMockStore()))
+	res := srv.UpstreamProxyResolver().(*upstreamProxyResolver)
+
+	res.mu.Lock()
+	// Fill to capacity with live (unexpired) entries.
+	for i := 0; i < maxUpstreamProxyCacheEntries; i++ {
+		res.cache[fmt.Sprintf("v%d|s%d", i, i)] = cachedUpstreamProxy{
+			proxy:     &brokercore.UpstreamProxy{Name: "p", Scheme: "http", Host: "a:3128"},
+			expiresAt: time.Now().Add(time.Hour),
+		}
+	}
+	// At capacity with all entries live, a new key must be declined rather
+	// than growing the map without bound.
+	res.setCacheLocked("v|extra", &brokercore.UpstreamProxy{Name: "p", Scheme: "http", Host: "a:3128"})
+	if _, ok := res.cache["v|extra"]; ok {
+		t.Fatal("cache grew beyond maxUpstreamProxyCacheEntries with all entries live")
+	}
+	if len(res.cache) > maxUpstreamProxyCacheEntries {
+		t.Fatalf("cache len = %d, want <= %d", len(res.cache), maxUpstreamProxyCacheEntries)
+	}
+
+	// But an expired entry first makes room: dropping it lets the new key in.
+	for k, v := range res.cache {
+		v.expiresAt = time.Now().Add(-time.Second)
+		res.cache[k] = v
+	}
+	// Patch one entry back to live so len drops by one after the sweep.
+	live := false
+	for k := range res.cache {
+		_ = k
+		if !live {
+			res.cache[k] = cachedUpstreamProxy{proxy: &brokercore.UpstreamProxy{Name: "p", Scheme: "http", Host: "a:3128"}, expiresAt: time.Now().Add(time.Hour)}
+			live = true
+		}
+	}
+	res.setCacheLocked("v|extra", &brokercore.UpstreamProxy{Name: "p", Scheme: "http", Host: "a:3128"})
+	if _, ok := res.cache["v|extra"]; !ok {
+		t.Fatal("after expiring entries make room, a new key should be cached")
+	}
+	if len(res.cache) > maxUpstreamProxyCacheEntries {
+		t.Fatalf("cache len = %d, want <= %d", len(res.cache), maxUpstreamProxyCacheEntries)
+	}
+	res.mu.Unlock()
+}
+
+func TestResolverMatchesServiceByAssignedSlug(t *testing.T) {
+	ms := newMockStore()
+	seedProxy(t, ms, "corp", "http", "corp.proxy:3128", false, true)
+	srv := newTestServer(withStore(ms))
+
+	const host = "api.anthropic.com"
+	slug := broker.Slugify(host, "", nil)
+	if slug == "" {
+		t.Fatalf("Slugify(%q) produced an empty slug", host)
+	}
+
+	// A stored service with an empty Name (legacy data) carries an upstream
+	// proxy reference. The resolver must still match it via the slug the
+	// service handlers assign, not silently fall through to the instance
+	// default (which is absent here → direct).
+	setServices(t, ms, "root-ns-id", []broker.Service{
+		{Name: "", Host: host, Auth: broker.Auth{Type: "passthrough"}, UpstreamProxy: "corp"},
+	})
+
+	res := srv.UpstreamProxyResolver()
+	got, err := res.ResolveUpstreamProxy(context.Background(), "root-ns-id", slug)
+	if err != nil {
+		t.Fatalf("resolve by slug %q: %v", slug, err)
+	}
+	if got == nil {
+		t.Fatal("expected the corp profile for the slug-matched service; got nil (direct)")
+	}
+	if got.Name != "corp" {
+		t.Fatalf("resolved profile = %q, want corp", got.Name)
+	}
+}
+
 func TestControlPlaneRoundTripperUsesDefaultProfile(t *testing.T) {
 	t.Setenv("AGENT_VAULT_ALLOW_PRIVATE_RANGES", "true")
 
@@ -319,6 +400,157 @@ func TestControlPlaneRoundTripperHonoursNoProxy(t *testing.T) {
 	if got := egressProxy.RequestCount(); got != 0 {
 		t.Fatalf("egress proxy saw %d requests for a no_proxy host, want 0", got)
 	}
+}
+
+// H1: an unusable default profile must not silently drop the control plane onto
+// a direct connection. Under fail_closed the request fails closed instead.
+func TestControlPlaneRoundTripperFailsClosedOnUnusableProfile(t *testing.T) {
+	t.Setenv("AGENT_VAULT_ALLOW_PRIVATE_RANGES", "true")
+
+	var reached int32
+	ms := newMockStore()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reached, 1)
+		_, _ = io.WriteString(w, "hello-from-upstream")
+	}))
+	defer upstream.Close()
+	// A host without a port can never be turned into a dialler.
+	seedProxy(t, ms, "broken", "http", "proxy.internal", true, true)
+
+	srv := newTestServer(withStore(ms))
+	req, err := http.NewRequest(http.MethodGet, upstream.URL+"/oauth/token", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if _, err := srv.ControlPlaneRoundTripper(nil).RoundTrip(req); err == nil {
+		t.Fatal("control-plane request succeeded through an unusable proxy; fail_closed must refuse it")
+	}
+	if got := atomic.LoadInt32(&reached); got != 0 {
+		t.Fatalf("upstream was reached %d times; the unusable proxy must not degrade to direct under fail_closed", got)
+	}
+}
+
+// H1: under fail_open the same unusable profile may fall back to a direct
+// connection.
+func TestControlPlaneRoundTripperFailsOpenOnUnusableProfile(t *testing.T) {
+	t.Setenv("AGENT_VAULT_ALLOW_PRIVATE_RANGES", "true")
+
+	ms := newMockStore()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "hello-from-upstream")
+	}))
+	defer upstream.Close()
+	broken := seedProxy(t, ms, "broken", "http", "proxy.internal", true, true)
+	broken.OnFailure = brokercore.UpstreamProxyFailOpen
+
+	srv := newTestServer(withStore(ms))
+	req, err := http.NewRequest(http.MethodGet, upstream.URL+"/oauth/token", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := srv.ControlPlaneRoundTripper(nil).RoundTrip(req)
+	if err != nil {
+		t.Fatalf("fail_open should fall back to a direct dial, got: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "hello-from-upstream" {
+		t.Fatalf("body = %q, want the direct upstream response", string(body))
+	}
+}
+
+// H2: a fail_open default proxy that is unreachable must fall back to a direct
+// dial; the control plane honours fail_open just like the MITM data plane.
+func TestControlPlaneRoundTripperFailsOpenWhenProxyUnreachable(t *testing.T) {
+	t.Setenv("AGENT_VAULT_ALLOW_PRIVATE_RANGES", "true")
+
+	ms := newMockStore()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "hello-from-upstream")
+	}))
+	defer upstream.Close()
+
+	egressProxy := egresstest.NewHTTPProxy(t, "", "")
+	p := seedProxy(t, ms, "default-corp", "http", egressProxy.Addr(), true, true)
+	p.OnFailure = brokercore.UpstreamProxyFailOpen
+
+	srv := newTestServer(withStore(ms))
+	rt := srv.ControlPlaneRoundTripper(nil)
+
+	// Proxy alive: traffic goes through it.
+	req, err := http.NewRequest(http.MethodGet, upstream.URL+"/oauth/token", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("control-plane request: %v", err)
+	}
+	_ = resp.Body.Close()
+	if got := egressProxy.RequestCount(); got != 1 {
+		t.Fatalf("egress proxy forwards = %d, want 1 while proxy is up", got)
+	}
+
+	// Proxy gone: fail_open falls back to a direct dial and still succeeds.
+	egressProxy.Close()
+	req2, err := http.NewRequest(http.MethodGet, upstream.URL+"/oauth/token", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp2, err := rt.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("fail_open should fall back to direct when the proxy is unreachable, got: %v", err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+	body, _ := io.ReadAll(resp2.Body)
+	if string(body) != "hello-from-upstream" {
+		t.Fatalf("body = %q, want the direct upstream response", string(body))
+	}
+}
+
+// H3: SMTP through a non-SOCKS default profile must not silently dial directly
+// under fail_closed — approvals and invites would leak past the egress policy.
+func TestControlPlaneDialRefusesHTTPProxyUnderFailClosed(t *testing.T) {
+	ms := newMockStore()
+	seedProxy(t, ms, "http-default", "http", "proxy.internal:3128", true, true)
+
+	srv := newTestServer(withStore(ms))
+	// A live listener proves any direct dial would succeed; the point is that
+	// controlPlaneDial refuses to even try it.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	_, err = srv.controlPlaneDial()("tcp", ln.Addr().String())
+	if err == nil {
+		t.Fatal("SMTP dial succeeded through an http proxy profile; fail_closed must refuse to bypass egress")
+	}
+	if !strings.Contains(err.Error(), "fail_closed") {
+		t.Fatalf("SMTP error = %v, want an explicit fail_closed refusal message", err)
+	}
+}
+
+// H3: under fail_open the same non-SOCKS profile may dial directly, mirroring
+// the fail_open promise that the proxy's absence is not an outage.
+func TestControlPlaneDialFallsBackDirectlyUnderFailOpen(t *testing.T) {
+	ms := newMockStore()
+	p := seedProxy(t, ms, "http-default", "http", "proxy.internal:3128", true, true)
+	p.OnFailure = brokercore.UpstreamProxyFailOpen
+
+	srv := newTestServer(withStore(ms))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	conn, err := srv.controlPlaneDial()("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("SMTP dial should fall back to direct under fail_open, got: %v", err)
+	}
+	_ = conn.Close()
 }
 
 func keyA(t *testing.T, fill byte) []byte {
